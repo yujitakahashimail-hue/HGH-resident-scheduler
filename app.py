@@ -1,5 +1,9 @@
-# app.py — Streamlit × OR-Tools 研修医シフト作成（完成・整理版）
+# =========================
+# app.py — Part 1 / 4
+# （このファイルは Part 1→4 を順に連結してください）
+# =========================
 
+# ---------- Imports ----------
 import io
 import json
 import os
@@ -20,9 +24,8 @@ try:
 except Exception:
     HAS_JPHOLIDAY = False
 
-# -------------------------
-# ページ設定 / 定数
-# -------------------------
+
+# ---------- ページ設定 / 定数 ----------
 st.set_page_config(page_title="研修医シフト作成", page_icon="🗓️", layout="wide")
 
 st.markdown(
@@ -39,12 +42,11 @@ st.markdown(
 )
 
 from datetime import datetime
-import sys, platform, os
-
+import sys, platform, os  # noqa: E402
 
 WEEKDAY_JA = ["月", "火", "水", "木", "金", "土", "日"]
 SHIFTS = ["ER_Early", "ER_Day1", "ER_Day2", "ER_Day3", "ER_Late", "ICU", "VAC"]
-ER_BASE = ["ER_Early", "ER_Day1", "ER_Late"]   
+ER_BASE = ["ER_Early", "ER_Day1", "ER_Late"]
 SHIFT_LABEL = {
     "ER_Early": "早番",
     "ER_Day1": "日勤1",
@@ -54,23 +56,15 @@ SHIFT_LABEL = {
     "ICU": "ICU",
     "VAC": "年休",
 }
-
 WEEKDAY_MAP = {"月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6}
 
-# -------------------------
-# 年/月・日付ユーティリティ
-# -------------------------
+# ---------- 年/月・日付ユーティリティ ----------
 this_year = dt.date.today().year
-# 初期値（ロード後に上書きされる可能性あり）
 default_year = this_year
 default_month = dt.date.today().month
 
-# ————— サイドバーの土台（年/月などの前にスナップショット関数を定義するため一旦保留） ————
 
-
-# -------------------------
-# スナップショット関連（先に定義）※ UIから呼ばれても未定義にならないように
-# -------------------------
+# ---------- スナップショット関連（先に定義） ----------
 def _serialize_for_json(obj):
     if isinstance(obj, (dt.date, dt.datetime)):
         return obj.isoformat()
@@ -82,7 +76,7 @@ def _current_settings_as_dict():
     """現UI状態を辞書化（後でUI構築後に上書きされる値は globals() / st.session_state から読む）"""
     ss = st.session_state
 
-    # 年/月・カレンダー関連（なければデフォルトで安全化）
+    # 年/月・カレンダー関連
     year = globals().get("year", default_year)
     month = globals().get("month", default_month)
     holidays = globals().get("holidays", [])
@@ -101,6 +95,7 @@ def _current_settings_as_dict():
     fix_repro = bool(globals().get("fix_repro", True))
     seed_val = int(globals().get("seed_val", 42)) if fix_repro else None
 
+    # ウェイト
     weight_day2_weekday = float(globals().get("weight_day2_weekday", 2.0))
     weight_day2_wed_bonus = float(globals().get("weight_day2_wed_bonus", 8.0))
     weight_day3_weekday = float(globals().get("weight_day3_weekday", 1.0))
@@ -153,7 +148,6 @@ def _apply_snapshot_dict(snap: dict):
     globals()["year"] = int(snap["period"]["year"])
     globals()["month"] = int(snap["period"]["month"])
 
-    # 祝日/休診日
     def _to_date_list(lst):
         out = []
         for x in lst or []:
@@ -236,6 +230,7 @@ def _apply_snapshot_dict(snap: dict):
         ss.prefs_draft = ss.prefs.copy()
         ss.prefs_editor_ver = ss.get("prefs_editor_ver", 0) + 1
 
+    # pins
     pins_df = pd.DataFrame(snap.get("pins", []))
     if not pins_df.empty and set(pins_df.columns) >= {"date", "name", "shift"}:
         try:
@@ -254,7 +249,8 @@ def make_snapshot(
     weight_icu_ratio=None, weight_pref_B=None, weight_pref_C=None,
     enable_fatigue=None, weight_fatigue=None,
     strict_mode=None, fix_repro=None, seed_val=None,
-    out_df=None, stat_df=None, status="UNKNOWN", objective=None
+    out_df=None, stat_df=None, status="UNKNOWN", objective=None,
+    fair_star=None, fair_slack_val=None      # ← 追加
 ):
     """実行スナップショット（結果も含める）"""
     ss = st.session_state
@@ -283,6 +279,12 @@ def make_snapshot(
     fix_repro = bool(fix_repro if fix_repro is not None else globals().get("fix_repro", True))
     seed_val = int(seed_val if seed_val is not None else globals().get("seed_val", 42)) if fix_repro else None
 
+    # ★ 公平性（スターと実スラック）も保存
+    if fair_star is None:
+        fair_star = int(st.session_state.get("star_fairness", 2))
+    if fair_slack_val is None:
+        fair_slack_val = int(STAR_TO_FAIR_SLACK.get(fair_star, 2))
+
     if special_map is None:
         spdf = ss.get("special_er", pd.DataFrame({"date": [], "drop_shift": []}))
         special_map = {r["date"]: r["drop_shift"] for _, r in spdf.iterrows() if pd.notna(r.get("date"))}
@@ -308,6 +310,8 @@ def make_snapshot(
             "max_weekend_icu_total": int(max_weekend_icu_total),
             "max_weekend_icu_per_person": int(max_weekend_icu_per_person),
             "strict_mode": bool(strict_mode),
+            "fair_star": int(fair_star),          # ← 追加
+            "fair_slack": int(fair_slack_val),    # ← 追加
             "weights": {
                 "day2_weekday": float(weight_day2_weekday),
                 "day2_wed_bonus": float(weight_day2_wed_bonus),
@@ -431,9 +435,7 @@ def apply_snapshot(js: dict):
         st.error(f"スナップショット適用に失敗しました: {e}")
 
 
-# -------------------------
-# セッション初期化
-# -------------------------
+# ---------- セッション初期化 ----------
 def _init_state():
     ss = st.session_state
     if "staff_df" not in ss:
@@ -465,9 +467,8 @@ def _init_state():
 
 _init_state()
 
-# -------------------------
-# サイドバー：基本入力（翌月をデフォルト）
-# -------------------------
+
+# ---------- サイドバー：基本入力（翌月をデフォルト） ----------
 st.sidebar.header("📌 必須情報")
 
 # 翌月を計算
@@ -481,13 +482,11 @@ else:
 if "_restore_year" in st.session_state:
     st.session_state["year_input"] = int(st.session_state.pop("_restore_year"))
 else:
-    # 初回は翌月の年をデフォルトに
     st.session_state.setdefault("year_input", next_year)
 
 if "_restore_month" in st.session_state:
     st.session_state["month_input"] = int(st.session_state.pop("_restore_month"))
 else:
-    # 初回は翌月をデフォルトに
     st.session_state.setdefault("month_input", next_month)
 
 # 2) ウィジェット作成（value/indexは渡さず key で制御）
@@ -496,15 +495,15 @@ year = st.sidebar.number_input(
     min_value=this_year - 2,
     max_value=this_year + 2,
     step=1,
-    key="year_input",   # ← ここが唯一のソース
+    key="year_input",
 )
 month = st.sidebar.selectbox(
     "作成月",
     list(range(1, 13)),
-    key="month_input",  # ← ここが唯一のソース（stateに入っている数値 1-12）
+    key="month_input",
 )
 
-# 3) 以降は変数をそのまま使えばOK
+# 3) 日付リスト等
 start_date = dt.date(year, month, 1)
 end_date = dt.date(year + (month == 12), (month % 12) + 1, 1) - dt.timedelta(days=1)
 all_days = [d.date() for d in rrule(DAILY, dtstart=start_date, until=end_date)]
@@ -521,7 +520,7 @@ DATE_TO_LABEL = {d: date_label(d) for d in all_days}
 holidays: list[dt.date] = []
 closed_days: list[dt.date] = []
 
-# --- 祝日：自動取得ヘルパー & UI（改良版） ---
+# --- 祝日：自動取得ヘルパー & UI ---
 def _jp_holidays_for(year: int, month: int) -> list[dt.date]:
     """当月の日本の祝日リスト（jpholiday が無い/失敗なら空）"""
     try:
@@ -550,13 +549,12 @@ if "holidays_ms" not in st.session_state:
 else:
     st.session_state["holidays_ms"] = [d for d in st.session_state["holidays_ms"] if d in all_days]
 
-# ---- UI部分（←ここを差し替え）----
-holbox = st.sidebar.container()     # まずコンテナを作る
+# ---- UI（祝日）----
+holbox = st.sidebar.container()
 with holbox:
     head_l, head_r = st.columns([1, 0.22])
     with head_l:
         st.markdown("#### 祝日（当月）")
-        # jpholiday の有無バッジ
         try:
             import jpholiday  # noqa: F401
             _hol_ok = True
@@ -569,7 +567,6 @@ with holbox:
             st.session_state["_refresh_holidays"] = True
             st.rerun()
 
-    # マルチセレクト本体（ラベルは畳む）
     holidays = st.multiselect(
         "",
         options=all_days,
@@ -578,21 +575,16 @@ with holbox:
         label_visibility="collapsed",
     )
 
-# 実体として使用
+# 実体
 holidays = st.session_state["holidays_ms"]
 
-# === 病院休診日（複数選択可） ===
-# 復元値があれば最優先
+# === 病院休診日 ===
 _restore_closed = st.session_state.pop("_restore_closed_days", None)
-
-# state 初期化/トリム（ウィジェット作成前に済ませる）
 if "closed_ms" not in st.session_state:
     st.session_state["closed_ms"] = [d for d in (_restore_closed or []) if d in all_days]
 else:
-    # 月をまたいだ後のゴミを除去
     st.session_state["closed_ms"] = [d for d in st.session_state["closed_ms"] if d in all_days]
 
-# UI（ヘッダー + 右側にクリアボタン）
 closed_box = st.sidebar.container()
 with closed_box:
     head_l, head_r = st.columns([1, 0.22])
@@ -604,7 +596,6 @@ with closed_box:
             st.session_state["closed_ms"] = []
             st.rerun()
 
-    # マルチセレクト本体（defaultは渡さず key だけ）
     closed_days = st.multiselect(
         "",
         options=all_days,
@@ -613,7 +604,6 @@ with closed_box:
         label_visibility="collapsed",
     )
 
-# 以降で使う実体
 closed_days = st.session_state["closed_ms"]
 
 st.sidebar.divider()
@@ -624,13 +614,15 @@ st.sidebar.caption("病院の年間休日カレンダーに記載の所定勤務
 
 st.sidebar.header("🗓️ 月ごとの設定")
 max_consecutive = st.sidebar.slider("最大連勤日数", 3, 7, 5)
-enable_fatigue = st.sidebar.checkbox("遅番→翌日早番を避ける", value=True)
-weight_fatigue = st.sidebar.slider(
-    "疲労ペナルティの重み", 0.0, 30.0, 6.0, 1.0, disabled=not enable_fatigue
-)
 
-allow_day3 = st.sidebar.checkbox("ER日勤3を許可", value=False, help="ON: チェックするとローテーターが多い時に日勤3が入れられるようになります（平日のみ）")
-allow_weekend_icu = st.sidebar.checkbox("週末ICUを許可", value=False, help="ON: チェックすると、土日祝にJ2のICUローテが入るようになります")
+allow_day3 = st.sidebar.checkbox(
+    "ER日勤3を許可", value=False,
+    help="ON: チェックするとローテーターが多い時に日勤3が入れられるようになります（平日のみ）"
+)
+allow_weekend_icu = st.sidebar.checkbox(
+    "週末ICUを許可", value=False,
+    help="ON: チェックすると、土日祝にJ2のICUローテが入るようになります"
+)
 max_weekend_icu_total = st.sidebar.number_input(
     "週末ICUの総上限（許可時のみ）", min_value=0, value=0, step=1, disabled=not allow_weekend_icu
 )
@@ -644,30 +636,136 @@ strict_mode = st.sidebar.checkbox(
     value=True,
     help="ON: J1休日ばらつき±1 / Day2・Day3ボーナス=通常。OFF: ±2 / ボーナス弱め。A希望・総勤務回数などのハード制約は常に厳守。",
 )
-fix_repro = st.sidebar.checkbox("再現性を固定", value=True, help="ON: 乱数シードの数値を維持することで同じ結果を再現しやすくなります",)
-seed_val = st.sidebar.number_input(
-    "乱数シード", min_value=0, max_value=1_000_000, value=42, step=1, disabled=not fix_repro
-)
 
+
+# ===== 星型UIコントロール定義（先に定義 / 1回だけ） =====
+def star_control(label, key, disabled=False, help=None, default=2):
+    # ★1〜3 の三段階に固定（★0は使わない）
+    options = [1, 2, 3]
+    fmt = lambda v: "★"*int(v) + "☆"*(3-int(v))
+
+    # 初回のみ初期値セット（以後は触らない）
+    if key not in st.session_state or st.session_state.get(key) is None:
+        d = int(default)
+        d = max(1, min(3, d))
+        st.session_state[key] = d
+
+    # value= は渡さない（session_stateの値をそのまま使わせる）
+    if hasattr(st, "segmented_control"):
+        val = st.segmented_control(
+            label=label, options=options, format_func=fmt,
+            key=key, disabled=disabled, help=help
+        )
+    else:
+        val = st.select_slider(
+            label, options=options, format_func=fmt,
+            key=key, disabled=disabled, help=help
+        )
+
+    return int(val if val is not None else st.session_state[key])
+
+
+# ===== サイドバー：詳細ウェイト設定 =====
 with st.sidebar.expander("⚙️ 詳細ウェイト設定", expanded=False):
-    weight_day2_weekday = st.slider("平日のER日勤2を入れる優先度", 0.0, 10.0, 2.0, 0.5)
-    weight_day2_wed_bonus = st.slider("水曜ボーナス（ER日勤2）", 0.0, 30.0, 8.0, 0.5)
-    weight_day3_weekday = st.slider(
-        "平日のER日勤3を入れる優先度", 0.0, 10.0, 1.0, 0.5, disabled=not allow_day3
+    st.markdown(
+        """
+        <div style="font-size:0.92em; line-height:1.5; padding:10px; border:1px solid #ddd; border-radius:8px;">
+          <b>このセクションは「目的関数」の重みづけ」です。</b><br>
+          各項目は ★1〜3 で強さを指定します（大きいほど優先）。<br>
+          ※ ハード制約に反するものは、どれだけ重みを上げても実現されません。
+        </div>
+        """,
+        unsafe_allow_html=True
     )
-    weight_day3_wed_bonus = st.slider(
-        "水曜ボーナス（ER日勤3）", 0.0, 30.0, 6.0, 0.5, disabled=not allow_day3
+
+    # --- 余白を挿入（見た目の間隔を空ける） ---
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # --- J1の休日勤務の公平性（ばらつき抑制） ---
+    s_fairness = star_control(
+        "休日勤務の公平性を優先（J1）", key="star_fairness",
+        help="J1の間での土日祝の勤務数の偏りを減らします。星1で±3, 星2で±2, 星3で±1までを許容とします。",
+        default=2
     )
-    weight_icu_ratio = st.slider("J2のICU希望比率の遵守 重み", 0.0, 10.0, 3.0, 0.5)
-    weight_pref_B = st.slider("希望B未充足ペナルティ", 0.0, 50.0, 10.0, 1.0)
-    weight_pref_C = st.slider("希望C未充足ペナルティ", 0.0, 50.0, 5.0, 1.0)
 
-# ===== 自動再開 用：最後の状態をディスクに保存／読込するヘルパー =====
-import json, os
+    # --- Day2 / Day3（平日優先＋水曜ボーナス） ---
+    s_day2_weekday = star_control(
+        "日勤2配置の優先度（平日）", key="star_day2_weekday",
+        help="平日に 日勤2 を“置ける日”で、置くことをどれだけ優先するか。",
+        default=2
+    )
+    s_day2_wed = star_control(
+        "水曜ボーナス（日勤2）", key="star_day2_wed",
+        help="水曜日だけ 日勤2 を特に優先する加点。",
+        default=2
+    )
+    s_day3_weekday = star_control(
+        "日勤3配置の優先度（平日）", key="star_day3_weekday",
+        disabled=not allow_day3,
+        help="平日に 日勤3 を置く優先度（許可している場合のみ有効）。",
+        default=2
+    )
+    s_day3_wed = star_control(
+        "水曜ボーナス（日勤3）", key="star_day3_wed",
+        disabled=not allow_day3,
+        help="水曜日だけ 日勤3 を特に優先する加点。",
+        default=2
+    )
 
-# ===== ディスク保存 / 復元（絶対に1か所だけ置く）=============================
+    # --- ICU希望比率 / B・C希望ペナルティ ---
+    s_icu_ratio = star_control(
+        "J2のICU希望比率の遵守（強さ）", key="star_icu_ratio",
+        help="J2の設定したICU希望比率に近づける重み。",
+        default=2
+    )
+    s_pref_b = star_control(
+        "希望B未充足ペナルティ（強さ）", key="star_pref_b",
+        help="B希望が叶わなかったときのペナルティ。",
+        default=3  # ★デフォルト3
+    )
+    s_pref_c = star_control(
+        "希望C未充足ペナルティ（強さ）", key="star_pref_c",
+        help="C希望が叶わなかったときのペナルティ。",
+        default=2
+    )
 
-# ファイルは app.py と同じフォルダに固定保存（タブを変えても同じファイルを参照できる）
+    # --- 疲労（遅番→翌早番の回避） ---
+    enable_fatigue = st.checkbox("疲労ペナルティを有効にする", value=True)
+    if enable_fatigue:
+        s_fatigue = star_control(
+            "疲労ペナルティの強さ", key="star_fatigue",
+            help="大きいほど『遅番の翌日に早番』を強く避けます。",
+            default=2  # ★デフォルト2
+        )
+    else:
+        s_fatigue = 2  # 有効でない場合も仮に★2扱い（重みは0で後処理）
+
+# ★→実数ウェイトの変換（1〜3のみ）
+STAR_TO_WEIGHT_DAY_WEEKDAY = {1: 2.0, 2: 6.0, 3: 12.0}
+STAR_TO_WEIGHT_WED_BONUS   = {1: 4.0, 2: 8.0, 3: 12.0}
+STAR_TO_WEIGHT_ICU_RATIO   = {1: 2.5, 2: 6.0, 3: 10.0}
+STAR_TO_WEIGHT_PREF_B      = {1: 10,  2: 25,  3: 50}
+STAR_TO_WEIGHT_PREF_C      = {1: 5,   2: 12,  3: 25}
+STAR_TO_WEIGHT_FATIGUE     = {1: 6.0, 2: 12.0, 3: 24.0}
+STAR_TO_FAIR_SLACK         = {1: 3, 2: 2, 3: 1}
+
+# 従来の変数名に変換
+weight_day2_weekday   = STAR_TO_WEIGHT_DAY_WEEKDAY[s_day2_weekday]
+weight_day2_wed_bonus = STAR_TO_WEIGHT_WED_BONUS[s_day2_wed]
+weight_day3_weekday   = STAR_TO_WEIGHT_DAY_WEEKDAY[s_day3_weekday]
+weight_day3_wed_bonus = STAR_TO_WEIGHT_WED_BONUS[s_day3_wed]
+weight_icu_ratio      = STAR_TO_WEIGHT_ICU_RATIO[s_icu_ratio]
+weight_pref_B         = STAR_TO_WEIGHT_PREF_B[s_pref_b]
+weight_pref_C         = STAR_TO_WEIGHT_PREF_C[s_pref_c]
+weight_fatigue        = STAR_TO_WEIGHT_FATIGUE[s_fatigue] if enable_fatigue else 0.0
+
+# ===== ここで Part 1 / 4 終了 =====
+# （続きは Part 2 へ）  # =========================
+# app.py — Part 2 / 4
+# =========================
+
+# ===== ディスク保存 / 復元（前回状態の読み書き） =====
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 LAST_SNAPSHOT_FILE = os.path.join(APP_DIR, ".streamlit_last_snapshot.json")
 
@@ -700,7 +798,7 @@ def load_last_snapshot_from_disk():
         st.sidebar.warning(f"読み込みに失敗: {e}")
         return None
 
-# --- サイドバーUI（重複させず1回だけ） ---
+# --- サイドバーUI（ディスク保存/復元） ---
 st.sidebar.divider()
 st.sidebar.subheader("🧷 前回状態（ディスク）")
 
@@ -717,15 +815,14 @@ else:
 
 c_a, c_b = st.sidebar.columns(2)
 
-# v1.41以降は width を使う（use_container_width は警告の原因）
-if c_a.button("💾 保存", key="btn_save_to_disk", width="stretch"):
+if c_a.button("💾 保存", key="btn_save_to_disk", use_container_width=True):
     ok, err = save_last_snapshot_to_disk()
     if ok:
         st.sidebar.success("保存しました。")
     else:
         st.sidebar.error(f"保存に失敗: {err}")
 
-if c_b.button("📥 復元", key="btn_restore_from_disk", width="stretch"):
+if c_b.button("📥 復元", key="btn_restore_from_disk", use_container_width=True):
     snap = load_last_snapshot_from_disk()
     if snap:
         _apply_snapshot_dict(snap)    # ここでUIに反映
@@ -734,23 +831,32 @@ if c_b.button("📥 復元", key="btn_restore_from_disk", width="stretch"):
     else:
         st.sidebar.info("前回ファイルがありません。")
 
+# -------------------------
+# 📂 スナップショットJSON（アップロードで即反映）
+# -------------------------
+st.sidebar.subheader("📂 スナップショットJSONをアップロードする")
+st.sidebar.caption(
+    "過去にダウンロードしたスナップショットJSONを読み込むと、"
+    "画面状態を一括復元できます。"
+)
+up_snap = st.sidebar.file_uploader(
+    "JSONを選択して『UIに反映』",
+    type=["json"],
+    key="sidebar_snapshot_uploader",
+    label_visibility="collapsed"
+)
+apply_up_btn = st.sidebar.button("🧷 反映する（再描画）", use_container_width=True, key="sidebar_apply_snapshot_btn")
 
+if up_snap is not None and apply_up_btn:
+    import json as _json
+    try:
+        snap_dict = _json.load(up_snap)
+        apply_snapshot(snap_dict)   # 既存の関数をそのまま利用（UIへ反映 & rerun）
+    except Exception as e:
+        st.sidebar.error(f"JSONの読み込みに失敗しました: {e}")
 
 # -------------------------
-# 💾 シナリオ保存 / 復元（統合・単一）
-# -------------------------
-st.sidebar.divider()
-
-
-# --- 手動セーブ/ロード（ディスク） ---
-st.sidebar.divider()
-
-# --- ここまで ---
-
-
-
-# -------------------------
-# 休日集合
+# 休日集合（後続の表示や検証で利用）
 # -------------------------
 H = set(d for d in all_days if d.weekday() >= 5) | set(holidays)
 
@@ -848,6 +954,7 @@ with st.form("staff_form", clear_on_submit=False):
             st.success("スタッフを保存しました。")
             st.rerun()
 
+# 実体のスタッフDF
 staff_df = st.session_state.get("staff_df", pd.DataFrame(columns=["name", "grade", "desired_icu_ratio"])).copy()
 if staff_df.empty:
     st.warning("少なくとも1名入力してください。")
@@ -953,7 +1060,7 @@ if submitted:
             st.info(info)
 
 # -------------------------
-# 希望（A/B/C）
+# 希望（A/B/C）エディタ
 # -------------------------
 st.subheader("📝 希望")
 st.caption("※ A=絶対;冠婚葬祭など / B=強く希望;旅行予定など / C=できれば;その他の用事など")
@@ -977,10 +1084,10 @@ edited = st.data_editor(
         ),
         "name": st.column_config.SelectboxColumn("名前", options=names),
         "kind": st.column_config.SelectboxColumn(
-    "種別",
-    options=["off", "early", "late", "day", "day1", "day2", "icu", "vacation"],
-    help="Aは off/early/late/（必要なら day1/day2/vacation）。day/icu のAは自動でBへ降格",
-),
+            "種別",
+            options=["off", "early", "late", "day", "day1", "day2", "icu", "vacation"],
+            help="Aは off/early/late/（必要なら day1/day2/vacation）。day/icu のAは自動でBへ降格",
+        ),
         "priority": st.column_config.SelectboxColumn("優先度", options=["A", "B", "C"]),
     },
 )
@@ -997,7 +1104,7 @@ with st.form("prefs_save_form", clear_on_submit=False):
         df["priority"] = df["priority"].astype(str).str.strip().str.upper()
         bad_mask = (df["priority"] == "A") & (df["kind"].isin(["day", "icu"]))
         df.loc[bad_mask, "priority"] = "B"
-        df = df[df["kind"].isin(["off", "early", "late", "day", "day1", "day2", "icu"])]
+        df = df[df["kind"].isin(["off", "early", "late", "day", "day1", "day2", "icu", "vacation"])]
         df = df[df["name"].isin(names)]
         df = df.drop_duplicates(subset=["date", "name", "kind", "priority"], keep="last").reset_index(drop=True)
 
@@ -1009,7 +1116,7 @@ with st.form("prefs_save_form", clear_on_submit=False):
         st.rerun()
 
 # -------------------------
-# プリアサイン
+# プリアサイン（固定割当）
 # -------------------------
 st.subheader("📌 事前のアサイン（固定割当）")
 st.caption("入力完了後に必ず保存ボタンを押してください。そうでないと、変更が反映されません。")
@@ -1069,6 +1176,7 @@ with st.form("pins_form", clear_on_submit=False):
         pins = tmp[(tmp["name"] != "") & (tmp["date_label"].isin(DATE_OPTIONS))].copy()
         pins["date"] = pins["date_label"].map(LABEL_TO_DATE)
 
+        # J1 の ICU プリアサインは無効化（警告表示）
         if not pins.empty:
             j1_names = set(staff_df.loc[staff_df["grade"] == "J1", "name"].tolist())
             bad = (pins["shift"] == "ICU") & (pins["name"].isin(j1_names))
@@ -1086,8 +1194,15 @@ with st.form("pins_form", clear_on_submit=False):
         st.success("プリアサインを保存しました。")
         st.rerun()
 
+# ===== ここで Part 2 / 4 終了 =====
+# （続きは Part 3 へ）
+
+# =========================
+# app.py — Part 3 / 4
+# =========================
+
 # -------------------------
-# 可否カレンダー
+# 可否カレンダー（Day2/Day3/ICU）
 # -------------------------
 DAY2_FORBID = set([d for d in all_days if d.weekday() >= 5]) | set(holidays) | set(closed_days)
 WEEKDAYS = set([d for d in all_days if d.weekday() < 5])
@@ -1110,7 +1225,7 @@ with st.expander("🗓️ Day2/Day3/ICU の設置可否カレンダー"):
     st.dataframe(cal_df, use_container_width=True, hide_index=True)
 
 # -------------------------
-# 前処理バリデーション
+# 前処理バリデーション（ボリューム等）
 # -------------------------
 R2 = len([d for d in all_days if (d.weekday() < 5 and d not in DAY2_FORBID)])
 R3 = len([d for d in all_days if (allow_day3 and d.weekday() < 5 and d not in DAY2_FORBID)])
@@ -1145,40 +1260,39 @@ if sum_J1 > max_ER_slots_info:
 # -------------------------
 # A希望の事前検証
 # -------------------------
-def validate_A_requests(prefs_df, DAY):
+def validate_A_requests(prefs_df: pd.DataFrame, DAY_template: dict) -> list[str]:
+    """A希望の物理不可能を早期チェック"""
     issues = []
     a_off = set()
-    for _, r in prefs_df[(prefs_df["priority"] == "A") & (prefs_df["kind"] == "off")].iterrows():
+
+    # A-休みの集合
+    for _, r in prefs_df[(prefs_df["priority"] == "A") & (prefs_df["kind"].str.lower() == "off")].iterrows():
         if r["date"] in all_days and r["name"] in name_to_idx:
             a_off.add((r["date"], r["name"]))
-    for _, r in prefs_df[prefs_df["priority"] == "A"].iterrows():
-        d = r["date"]
-        nm = r["name"]
-        k = str(r["kind"]).lower()
-        if d not in all_days or nm not in name_to_idx:
-            continue
-        if (d, nm) in a_off and k != "off":
-            issues.append(f"{d} {nm}: A-休み と A-{k} は同日に共存できません")
-    # すでに a_off セットがある前提で
+
+    # A-休みと同日の他A
     for _, r in prefs_df[prefs_df["priority"] == "A"].iterrows():
         d, nm, k = r["date"], r["name"], str(r["kind"]).lower()
         if d not in all_days or nm not in name_to_idx:
             continue
+        if (d, nm) in a_off and k != "off":
+            issues.append(f"{d} {nm}: A-休み と A-{k} は同日に共存できません")
         if (d, nm) in a_off and k == "vacation":
             issues.append(f"{d} {nm}: A-休み と A-vacation は同日に共存できません")
 
+    # J1のA-ICUは不可
     j1_names = set(staff_df.loc[staff_df["grade"] == "J1", "name"].tolist())
     for _, r in prefs_df[(prefs_df["priority"] == "A") & (prefs_df["kind"].str.lower() == "icu")].iterrows():
         if r["name"] in j1_names:
             issues.append(f"{r['date']} {r['name']}: J1 に A-ICU は割当不可能です")
 
+    # 特例や可否
     for _, r in prefs_df[prefs_df["priority"] == "A"].iterrows():
-        d = r["date"]
-        nm = r["name"]
-        k = str(r["kind"]).lower()
+        d, nm, k = r["date"], r["name"], str(r["kind"]).lower()
         if d not in all_days or nm not in name_to_idx:
             continue
         di = all_days.index(d)
+        DAY = DAY_template
         if k == "early" and DAY[di]["req"]["ER_Early"] == 0:
             issues.append(f"{d} {nm}: 特例で早番が停止中のため A-early は不可能です")
         if k == "late" and DAY[di]["req"]["ER_Late"] == 0:
@@ -1190,56 +1304,70 @@ def validate_A_requests(prefs_df, DAY):
         if k == "icu" and not DAY[di]["allow_icu"]:
             issues.append(f"{d} {nm}: その日はICU不可のため A-ICU は不可能です")
 
+    # 同一スロットへのA過多
     a_counts = {}
     for _, r in prefs_df[prefs_df["priority"] == "A"].iterrows():
-        d = r["date"]
-        k = str(r["kind"]).lower()
+        d, k = r["date"], str(r["kind"]).lower()
         if d in all_days:
             di = all_days.index(d)
             key = None
-            if k == "early" and DAY[di]["req"]["ER_Early"] == 1:
+            if k == "early" and DAY_template[di]["req"]["ER_Early"] == 1:
                 key = ("ER_Early", di)
-            if k == "late" and DAY[di]["req"]["ER_Late"] == 1:
+            if k == "late" and DAY_template[di]["req"]["ER_Late"] == 1:
                 key = ("ER_Late", di)
-            if k == "day1" and DAY[di]["req"]["ER_Day1"] == 1:
+            if k == "day1" and DAY_template[di]["req"]["ER_Day1"] == 1:
                 key = ("ER_Day1", di)
-            if k == "day2" and DAY[di]["allow_d2"]:
+            if k == "day2" and DAY_template[di]["allow_d2"]:
                 key = ("ER_Day2", di)
-            if k == "icu" and DAY[di]["allow_icu"]:
+            if k == "icu" and DAY_template[di]["allow_icu"]:
                 key = ("ICU", di)
             if key:
                 a_counts.setdefault(key, 0)
                 a_counts[key] += 1
+
     for (shift_name, di), cnt in a_counts.items():
-        cap = 1
-        if cnt > cap:
-            issues.append(f"{all_days[di]} {shift_name}: A希望が{cnt}件あり、定員{cap}を超えています")
+        if cnt > 1:
+            issues.append(f"{all_days[di]} {shift_name}: A希望が{cnt}件あり、定員1を超えています")
 
     return issues
 
 # -------------------------
-# ソルバー
+# ソルバー本体
 # -------------------------
-def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: bool = False, repro_fix: bool = True):
+def build_and_solve(
+    fair_slack: int,
+    disabled_pref_ids: set,
+    weaken_day2_bonus: bool = False,
+    repro_fix: bool = True,
+):
     model = cp_model.CpModel()
-    x = {(d, s, i): model.NewBoolVar(f"x_d{d}_s{s}_i{i}") for d in range(D) for s in range(len(SHIFTS)) for i in range(N)}
 
-    for d in range(D):
-        for i in range(N):
-            if (d, i) not in allow_vac:
-                model.Add(x[(d, VAC_IDX, i)] == 0)
+    # 便利なインデックス（SHIFTS は Part 1 で定義済み）
+    E_IDX   = SHIFTS.index("ER_Early")
+    D1_IDX  = SHIFTS.index("ER_Day1")
+    D2_IDX  = SHIFTS.index("ER_Day2")
+    D3_IDX  = SHIFTS.index("ER_Day3")
+    L_IDX   = SHIFTS.index("ER_Late")
+    ICU_IDX = SHIFTS.index("ICU")
+    VAC_IDX = SHIFTS.index("VAC")
 
+    # 変数: x[d, s, i] ∈ {0,1}
+    x = {
+        (d, s, i): model.NewBoolVar(f"x_d{d}_s{s}_i{i}")
+        for d in range(D) for s in range(len(SHIFTS)) for i in range(N)
+    }
+
+    # 1日1人1枠まで
     for d in range(D):
         for i in range(N):
             model.Add(sum(x[(d, s, i)] for s in range(len(SHIFTS))) <= 1)
 
-    ICU_IDX = SHIFTS.index("ICU")
+    # J1 は ICU 不可
     for d in range(D):
         for i in [j for j in range(N) if staff_df.iloc[j]["grade"] == "J1"]:
             model.Add(x[(d, ICU_IDX, i)] == 0)
 
-    VAC_IDX = SHIFTS.index("VAC")
-
+    # 最大連勤
     for i in range(N):
         y = [model.NewBoolVar(f"y_d{d}_i{i}") for d in range(D)]
         for d in range(D):
@@ -1249,11 +1377,13 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
             for start in range(0, D - window + 1):
                 model.Add(sum(y[start + k] for k in range(window)) <= max_consecutive)
 
+    # 個々の総勤務回数（= per_person_total）
     for i in range(N):
         ti = model.NewIntVar(0, 5 * D, f"total_i{i}")
         model.Add(ti == sum(x[(d, s, i)] for d in range(D) for s in range(len(SHIFTS))))
         model.Add(ti == int(per_person_total))
 
+    # 日ごとの枠・可否（特例と休日設定を反映）
     DAY = {
         d: {"req": {"ER_Early": 1, "ER_Day1": 1, "ER_Late": 1}, "allow_d2": False, "allow_d3": False, "allow_icu": False, "drop": None}
         for d in range(D)
@@ -1272,25 +1402,32 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
         if day in ICU_ALLOWED_DAYS_LOCAL:
             DAY[d]["allow_icu"] = True
 
+    # ER 基本枠（早/日1/遅）の充足
     for d in range(D):
         for base in ER_BASE:
             sidx = SHIFTS.index(base)
             model.Add(sum(x[(d, sidx, i)] for i in range(N)) == DAY[d]["req"][base])
 
-    D2_IDX = SHIFTS.index("ER_Day2")
-    D3_IDX = SHIFTS.index("ER_Day3")
+    # D2/D3/ICU は可の日のみ 0/1
     for d in range(D):
         model.Add(sum(x[(d, D2_IDX, i)] for i in range(N)) <= (1 if DAY[d]["allow_d2"] else 0))
         model.Add(sum(x[(d, D3_IDX, i)] for i in range(N)) <= (1 if DAY[d]["allow_d3"] else 0))
-    for d in range(D):
         model.Add(sum(x[(d, ICU_IDX, i)] for i in range(N)) <= (1 if DAY[d]["allow_icu"] else 0))
 
+    # Day1 が立っている日だけ Day2/Day3 を許可（連動制約）
+    for d in range(D):
+        total_d1 = sum(x[(d, D1_IDX, i)] for i in range(N))
+        model.Add(sum(x[(d, D2_IDX, i)] for i in range(N)) <= total_d1)
+        model.Add(sum(x[(d, D3_IDX, i)] for i in range(N)) <= total_d1)
+
+    # 週末ICUの総量/個人上限
     if allow_weekend_icu:
         weekend_days = [d for d, day in enumerate(all_days) if day.weekday() >= 5]
         model.Add(sum(x[(d, ICU_IDX, i)] for d in weekend_days for i in range(N)) <= int(max_weekend_icu_total))
         for i in range(N):
             model.Add(sum(x[(d, ICU_IDX, i)] for d in weekend_days) <= int(max_weekend_icu_per_person))
 
+    # プリアサイン（固定）
     pins_df = st.session_state.get("pins", pd.DataFrame(columns=["date", "name", "shift"]))
     for _, row in pins_df.iterrows():
         d = all_days.index(row["date"]) if row["date"] in all_days else None
@@ -1305,22 +1442,37 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
             continue
         model.Add(x[(d, sidx, i)] == 1)
 
+    # 希望（A/B/C）
     prefs_eff = st.session_state.prefs.copy()
     prefs_eff["kind"] = prefs_eff["kind"].astype(str).str.strip().str.lower()
     prefs_eff["priority"] = prefs_eff["priority"].astype(str).str.strip().str.upper()
 
-    # vacation をリクエストした (d,i) のみ年休可
+    # --- Vacation（年休）を許可する (d,i) の集合 ---
     allow_vac = set()
-    for _, r in prefs_eff.iterrows():
-        if r["date"] in all_days and r["name"] in name_to_idx:
-            if str(r["kind"]).strip().lower() == "vacation":
-                d = all_days.index(r["date"])
-                i = name_to_idx[r["name"]]
+    for _, row in prefs_eff.iterrows():
+        try:
+            kind = str(row["kind"]).lower().strip()
+            pr   = str(row["priority"]).upper().strip()
+            dte  = row["date"]
+            nm   = row["name"]
+        except Exception:
+            continue
+        if kind == "vacation" and pr in ("A", "B", "C"):
+            if dte in all_days and nm in name_to_idx:
+                d = all_days.index(dte)
+                i = name_to_idx[nm]
                 allow_vac.add((d, i))
 
-    pref_soft = []
-    A_star = set()
-    A_off = defaultdict(list)
+    # 許可されていない (d,i) は VAC=0
+    for d in range(D):
+        for i in range(N):
+            if (d, i) not in allow_vac:
+                model.Add(x[(d, VAC_IDX, i)] == 0)
+
+    # Aは基本的にハード制約化、B/Cは目的関数でペナルティ
+    pref_soft = []        # (rid, d, i, kind, pr)  … B/C or 落としたAの代替
+    A_star = set()        # (d, shift_name, name)
+    A_off  = defaultdict(list)
 
     for rid, row in prefs_eff.reset_index(drop=True).iterrows():
         if row["date"] not in all_days or row["name"] not in name_to_idx:
@@ -1330,6 +1482,7 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
         kind = row["kind"]
         pr = row["priority"]
 
+        # day/icu の A は B に降格（UI側でもやっているが二重防御）
         if pr == "A" and kind in ("day", "icu"):
             pr = "B"
 
@@ -1339,32 +1492,32 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
                 A_off[d].append(row["name"])
             elif kind == "early":
                 if DAY[d]["req"]["ER_Early"] == 1:
-                    model.Add(x[(d, SHIFTS.index("ER_Early"), i)] == 1)
+                    model.Add(x[(d, E_IDX, i)] == 1)
                     A_star.add((d, "ER_Early", row["name"]))
                 else:
                     pref_soft.append((rid, d, i, "early", "B"))
             elif kind == "late":
                 if DAY[d]["req"]["ER_Late"] == 1:
-                    model.Add(x[(d, SHIFTS.index("ER_Late"), i)] == 1)
+                    model.Add(x[(d, L_IDX, i)] == 1)
                     A_star.add((d, "ER_Late", row["name"]))
                 else:
                     pref_soft.append((rid, d, i, "late", "B"))
             elif kind == "day1":
                 if DAY[d]["req"]["ER_Day1"] == 1:
-                    model.Add(x[(d, SHIFTS.index("ER_Day1"), i)] == 1)
+                    model.Add(x[(d, D1_IDX, i)] == 1)
                     A_star.add((d, "ER_Day1", row["name"]))
                 else:
                     pref_soft.append((rid, d, i, "day1", "B"))
             elif kind == "day2":
                 if DAY[d]["allow_d2"]:
-                    model.Add(x[(d, SHIFTS.index("ER_Day2"), i)] == 1)
+                    model.Add(x[(d, D2_IDX, i)] == 1)
                     A_star.add((d, "ER_Day2", row["name"]))
                 else:
                     pref_soft.append((rid, d, i, "day2", "B"))
             elif kind == "vacation":
+                # 事前に allow_vac に入っているため、ここは単純に 1 固定でOK
                 model.Add(x[(d, VAC_IDX, i)] == 1)
                 A_star.add((d, "VAC", row["name"]))
-            
             else:
                 pref_soft.append((rid, d, i, kind, "B"))
         else:
@@ -1372,6 +1525,7 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
                 continue
             pref_soft.append((rid, d, i, kind, pr))
 
+    # 休日回数のバランス（J1）
     hol = []
     Hd = [idx for idx, day in enumerate(all_days) if (day.weekday() >= 5 or day in holidays)]
     for i in range(N):
@@ -1388,6 +1542,7 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
             model.Add(diff <= fair_slack)
             model.Add(-diff <= fair_slack)
 
+    # J1 ≧ J2 の休日（上限的に）
     if len(J1_idx) > 0 and len(J2_idx) > 0:
         j1max = model.NewIntVar(0, 5 * D, "j1max_hol")
         for a in J1_idx:
@@ -1395,23 +1550,17 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
         for j in J2_idx:
             model.Add(hol[j] <= j1max)
 
-    E_IDX = SHIFTS.index("ER_Early")
-    L_IDX = SHIFTS.index("ER_Late")
-    D1_IDX = SHIFTS.index("ER_Day1")
-    D2X_IDX = SHIFTS.index("ER_Day2")
-    early_cnt = []
-    late_cnt = []
-    day12_cnt = []
+    # J1 内の早/遅/日勤(1+2)の偏り±2
+    early_cnt, late_cnt, day12_cnt = [], [], []
     for i in range(N):
         ei = model.NewIntVar(0, D, f"early_i{i}")
-        model.Add(ei == sum(x[(d, E_IDX, i)] for d in range(D)))
-        early_cnt.append(ei)
         li = model.NewIntVar(0, D, f"late_i{i}")
-        model.Add(li == sum(x[(d, L_IDX, i)] for d in range(D)))
-        late_cnt.append(li)
         di = model.NewIntVar(0, 2 * D, f"day12_i{i}")
-        model.Add(di == sum(x[(d, D1_IDX, i)] + x[(d, D2X_IDX, i)] for d in range(D)))
-        day12_cnt.append(di)
+        model.Add(ei == sum(x[(d, E_IDX, i)] for d in range(D)))
+        model.Add(li == sum(x[(d, L_IDX, i)] for d in range(D)))
+        model.Add(di == sum(x[(d, D1_IDX, i)] + x[(d, D2_IDX, i)] for d in range(D)))
+        early_cnt.append(ei); late_cnt.append(li); day12_cnt.append(di)
+
     for a in J1_idx:
         for b in J1_idx:
             if a >= b:
@@ -1422,7 +1571,10 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
                 model.Add(df <= 2)
                 model.Add(-df <= 2)
 
+    # 目的関数（未充足ペナルティ／疲労／D2・D3配置ボーナス／ICU比率）
     terms = []
+
+    # B/C 希望ペナルティ
     for rid, d, i, kind, pr in pref_soft:
         w = weight_pref_B if pr == "B" else weight_pref_C
         if w <= 0:
@@ -1430,24 +1582,24 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
         assigned_any = model.NewBoolVar(f"assign_any_d{d}_i{i}")
         model.Add(assigned_any == sum(x[(d, s, i)] for s in range(len(SHIFTS))))
         if kind == "off":
-            terms.append(int(100 * w) * assigned_any)
+            terms.append(int(100 * w) * assigned_any)  # 出勤してしまったらペナルティ
         elif kind == "early" and DAY[d]["req"]["ER_Early"] == 1:
-            correct = x[(d, SHIFTS.index("ER_Early"), i)]
+            correct = x[(d, E_IDX, i)]
             miss = model.NewBoolVar(f"pref_early_miss_d{d}_i{i}")
             model.Add(miss + correct == 1)
             terms.append(int(100 * w) * miss)
         elif kind == "late" and DAY[d]["req"]["ER_Late"] == 1:
-            correct = x[(d, SHIFTS.index("ER_Late"), i)]
+            correct = x[(d, L_IDX, i)]
             miss = model.NewBoolVar(f"pref_late_miss_d{d}_i{i}")
             model.Add(miss + correct == 1)
             terms.append(int(100 * w) * miss)
         elif kind == "day1" and DAY[d]["req"]["ER_Day1"] == 1:
-            correct = x[(d, SHIFTS.index("ER_Day1"), i)]
+            correct = x[(d, D1_IDX, i)]
             miss = model.NewBoolVar(f"pref_day1_miss_d{d}_i{i}")
             model.Add(miss + correct == 1)
             terms.append(int(100 * w) * miss)
         elif kind == "day2" and DAY[d]["allow_d2"]:
-            correct = x[(d, SHIFTS.index("ER_Day2"), i)]
+            correct = x[(d, D2_IDX, i)]
             miss = model.NewBoolVar(f"pref_day2_miss_d{d}_i{i}")
             model.Add(miss + correct == 1)
             terms.append(int(100 * w) * miss)
@@ -1456,17 +1608,15 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
             day2_ok = DAY[d]["allow_d2"]
             if day1_ok or day2_ok:
                 cands = []
-                if day1_ok:
-                    cands.append(x[(d, SHIFTS.index("ER_Day1"), i)])
-                if day2_ok:
-                    cands.append(x[(d, SHIFTS.index("ER_Day2"), i)])
+                if day1_ok: cands.append(x[(d, D1_IDX, i)])
+                if day2_ok: cands.append(x[(d, D2_IDX, i)])
                 correct = model.NewBoolVar(f"pref_day_any_ok_d{d}_i{i}")
                 model.AddMaxEquality(correct, cands)
                 miss = model.NewBoolVar(f"pref_day_miss_d{d}_i{i}")
                 model.Add(miss + correct == 1)
                 terms.append(int(100 * w) * miss)
         elif kind == "icu" and (i in J2_idx) and DAY[d]["allow_icu"]:
-            correct = x[(d, SHIFTS.index("ICU"), i)]
+            correct = x[(d, ICU_IDX, i)]
             miss = model.NewBoolVar(f"pref_icu_miss_d{d}_i{i}")
             model.Add(miss + correct == 1)
             terms.append(int(100 * w) * miss)
@@ -1474,11 +1624,10 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
             correct = x[(d, VAC_IDX, i)]
             miss = model.NewBoolVar(f"pref_vac_miss_d{d}_i{i}")
             model.Add(miss + correct == 1)
-            terms.append(int(100 * w) * miss)    
+            terms.append(int(100 * w) * miss)
 
+    # 疲労（遅番→翌早番）
     if enable_fatigue and weight_fatigue > 0:
-        L_IDX = SHIFTS.index("ER_Late")
-        E_IDX = SHIFTS.index("ER_Early")
         for i in range(N):
             for d in range(D - 1):
                 f = model.NewBoolVar(f"fatigue_d{d}_i{i}")
@@ -1487,10 +1636,11 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
                 model.Add(f <= x[(d + 1, E_IDX, i)])
                 terms.append(int(100 * weight_fatigue) * f)
 
+    # Day2/Day3 の配置ボーナス（置ける日なのに置かなかったら損）
     for d, day in enumerate(all_days):
         if DAY[d]["allow_d2"]:
             placed = model.NewBoolVar(f"d2_placed_{d}")
-            model.Add(placed == sum(x[(d, SHIFTS.index("ER_Day2"), i)] for i in range(N)))
+            model.Add(placed == sum(x[(d, D2_IDX, i)] for i in range(N)))
             w = weight_day2_weekday + (weight_day2_wed_bonus if day.weekday() == 2 else 0.0)
             if weaken_day2_bonus:
                 w = max(0.0, w * 0.5)
@@ -1498,18 +1648,19 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
                 terms.append(int(100 * w) * (1 - placed))
         if DAY[d]["allow_d3"]:
             placed3 = model.NewBoolVar(f"d3_placed_{d}")
-            model.Add(placed3 == sum(x[(d, SHIFTS.index("ER_Day3"), i)] for i in range(N)))
+            model.Add(placed3 == sum(x[(d, D3_IDX, i)] for i in range(N)))
             w3 = weight_day3_weekday + (weight_day3_wed_bonus if day.weekday() == 2 else 0.0)
             if weaken_day2_bonus:
                 w3 = max(0.0, w3 * 0.5)
             if w3 > 0:
                 terms.append(int(100 * w3) * (1 - placed3))
 
+    # ICU 希望比率の偏差
     if weight_icu_ratio > 0 and len(J2_idx) > 0:
         scale = 100
         for j in J2_idx:
             ICU_j = model.NewIntVar(0, 5 * D, f"ICU_j{j}")
-            model.Add(ICU_j == sum(x[(d, SHIFTS.index("ICU"), j)] for d in range(D)))
+            model.Add(ICU_j == sum(x[(d, ICU_IDX, j)] for d in range(D)))
             target_scaled = model.NewIntVar(0, scale * 5 * D, f"icu_target_j{j}")
             desired = float(staff_df.iloc[j]["desired_icu_ratio"])
             model.Add(target_scaled == int(round(desired * scale)) * int(per_person_total))
@@ -1523,6 +1674,7 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
 
     model.Minimize(sum(terms))
 
+    # ---- Solve ----
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 20.0
     solver.parameters.num_search_workers = 1 if (fix_repro and repro_fix) else 8
@@ -1544,7 +1696,7 @@ def build_and_solve(fair_slack: int, disabled_pref_ids: set, weaken_day2_bonus: 
     return status_map.get(status, "UNKNOWN"), solver, artifacts
 
 # -------------------------
-# infeasible 時のブロッキングA特定
+# infeasible 時のブロッキングA特定（1件ずつ）
 # -------------------------
 def find_blocking_A_once(fair_slack_base: int, weaken_base: bool):
     """Aレコードを1件ずつ無効化して解けるか検査。戻り値: list[(rid, row_dict)]"""
@@ -1553,122 +1705,92 @@ def find_blocking_A_once(fair_slack_base: int, weaken_base: bool):
     blockers = []
     for rid, row in A_only.iterrows():
         tmp = prefs_base.copy()
-        tmp.loc[rid, "priority"] = "Z"
+        tmp.loc[rid, "priority"] = "Z"  # 一時的に無効化
         bak = st.session_state.prefs
         st.session_state.prefs = tmp
         s, sol, a = build_and_solve(
-            fair_slack=fair_slack_base, disabled_pref_ids=set(), weaken_day2_bonus=weaken_base
+            fair_slack=fair_slack_base, disabled_pref_ids=set(),
+            weaken_day2_bonus=weaken_base
         )
         st.session_state.prefs = bak
         if s in ("OPTIMAL", "FEASIBLE"):
             blockers.append((rid, row.to_dict()))
     return blockers
 
+# ===== ここで Part 3 / 4 終了 =====
+# （続きは Part 4 へ：実行ボタン、結果表示、ダウンロード）  
+
+# =========================
+# app.py — Part 4 / 4
+# =========================
+
 # -------------------------
-# 実行ボタン & 自動リトライ
+# 実行セクション
 # -------------------------
-run = st.button("🚀 生成する（最適化）")
-relax_log = []
+st.header("🧩 スケジュール自動生成")
 
-if run:
-    # DAYマップ（検証用）
-    DAY_tmp = {
-        d: {"req": {"ER_Early": 1, "ER_Day1": 1, "ER_Late": 1}, "allow_d2": False, "allow_d3": False, "allow_icu": False, "drop": None}
-        for d in range(D)
-    }
-    DAY2_FORBID_LOCAL = set([d for d in all_days if d.weekday() >= 5]) | set(holidays) | set(closed_days)
-    ICU_ALLOWED_DAYS_LOCAL = set(all_days) if allow_weekend_icu else set([d for d in all_days if d.weekday() < 5])
-    for d, day in enumerate(all_days):
-        drop = special_map.get(day)
-        if drop in ER_BASE:
-            DAY_tmp[d]["req"][drop] = 0
-            DAY_tmp[d]["drop"] = drop
-        if day.weekday() < 5 and day not in DAY2_FORBID_LOCAL:
-            DAY_tmp[d]["allow_d2"] = True
-            DAY_tmp[d]["allow_d3"] = bool(allow_day3)
-        if day in ICU_ALLOWED_DAYS_LOCAL:
-            DAY_tmp[d]["allow_icu"] = True
+fair_slack = STAR_TO_FAIR_SLACK.get(s_fairness, 2)
+weaken_day2_bonus = False
 
-    issues = validate_A_requests(st.session_state.prefs.copy(), DAY_tmp)
-    if issues:
-        st.error("A希望に物理的に不可能な指定が含まれています。以下を修正してください：\n- " + "\n- ".join(issues))
-        st.stop()
+fix_repro = st.checkbox(
+    "再現性を固定",
+    value=True,
+    help="ONにすると、下の乱数シード値を使って同じ条件で同じ勤務表を再現できます。"
+)
 
-    disabled_pref_ids = set()
-    disabled_log_rows = []
-
-    status, solver, art = build_and_solve(
-        fair_slack=(1 if strict_mode else 2),
-        disabled_pref_ids=disabled_pref_ids,
-        weaken_day2_bonus=(not strict_mode),
+if fix_repro:
+    seed_val = st.number_input(
+        "乱数シード値",
+        min_value=0, max_value=1_000_000, value=42, step=1,
+        help="同じ条件で同じ勤務表を再現したい場合に利用します。"
     )
+    st.caption("🔑 同じseed値であれば、同じ条件の勤務表を再現できます。")
+else:
+    seed_val = None
+    st.caption("🎲 OFFにすると、毎回異なる乱数でスケジュールを生成します。")
 
-    if status in ("INFEASIBLE", "UNKNOWN"):
-        relax_log.append(("fairness", "J1休日ばらつきを ±1→±2 に緩和"))
-        status, solver, art = build_and_solve(
-            fair_slack=2, disabled_pref_ids=disabled_pref_ids, weaken_day2_bonus=False
+# =========================
+# 🚀 実行ボタン＆最適化処理（押すまで何も表示しない）
+# =========================
+
+run_btn = st.button("🚀 勤務表を作成する", type="primary", use_container_width=True, key="generate_schedule")
+
+if run_btn:
+    if fix_repro:
+        st.caption("※ 乱数シードを固定中（同じ条件なら再現しやすくなります）")
+
+    with st.spinner("最適化中... 最大20秒ほどかかることがあります"):
+        status, solver, artifacts = build_and_solve(
+            fair_slack=fair_slack,                     # ← ★つまみの値から自動計算済み
+            disabled_pref_ids=set(),
+            weaken_day2_bonus=weaken_day2_bonus,
+            repro_fix=fix_repro
         )
 
-    if status in ("INFEASIBLE", "UNKNOWN"):
-        relax_log.append(("bonus", "Day2/Day3の平日・水曜ボーナスを一段弱め"))
-        status, solver, art = build_and_solve(
-            fair_slack=2, disabled_pref_ids=disabled_pref_ids, weaken_day2_bonus=True
-        )
+    st.write(f"**Solver status:** {status}")
 
-    def iteratively_disable(level: str, disabled_ids: set):
-        log_rows = []
-        prefs_all = st.session_state.prefs.reset_index()  # rid=index
-        target = prefs_all[prefs_all["priority"] == level]
-        for rid, row in target.iterrows():
-            if rid in disabled_ids:
-                continue
-            disabled_ids2 = set(disabled_ids)
-            disabled_ids2.add(rid)
-            s, sol, a = build_and_solve(
-                fair_slack=2, disabled_pref_ids=disabled_ids2, weaken_day2_bonus=True
-            )
-            if s in ("OPTIMAL", "FEASIBLE"):
-                log_rows.append(row.to_dict())
-                return s, sol, a, disabled_ids2, log_rows
-        return None, None, None, disabled_ids, log_rows
-
-    while status in ("INFEASIBLE", "UNKNOWN"):
-        s, sol, a, disabled_pref_ids, logs = iteratively_disable("C", disabled_pref_ids)
-        if s is None:
-            break
-        disabled_log_rows.extend(logs)
-        status, solver, art = s, sol, a
-
-    while status in ("INFEASIBLE", "UNKNOWN"):
-        s, sol, a, disabled_pref_ids, logs = iteratively_disable("B", disabled_pref_ids)
-        if s is None:
-            break
-        disabled_log_rows.extend(logs)
-        status, solver, art = s, sol, a
-
+    # ← ここから先はボタンを押した時だけ評価される
     if status not in ("OPTIMAL", "FEASIBLE"):
-        st.error("A希望をすべて厳守すると可行解が見つかりませんでした。以下の A を外すと解ける可能性があります：")
-        blockers = find_blocking_A_once(fair_slack_base=2, weaken_base=True)
-        if blockers:
-            for rid, row in blockers:
-                st.write(f"- {row['date']} {row['name']} A-{row['kind']}")
-            st.info("対応案：該当日の ER 基本枠を特例で停止 / A をBへ変更 などをご検討ください。")
-        else:
-            st.info("単体除外では特定できませんでした（複数Aの組合せが原因の可能性）。")
+        st.error("❌ 可行解が見つかりませんでした。A希望・特例・総勤務回数の整合をご確認ください。")
         st.stop()
 
-    # -------------------------
-    # 出力テーブル
-    # -------------------------
-    A_star = art["A_star"]
-    A_off = art["A_off"]
-    x = art["x"]
+    # 成功時の表示（out_df/stat_df の作成や st.success など）
+    # ... あなたの成功時ブロックをここに置く ...
 
+    # ---------- ここから成功時だけ表示 ----------
+    x        = artifacts["x"]
+    DAY      = artifacts["DAY"]
+    A_star   = artifacts.get("A_star", set())
+    A_off    = artifacts.get("A_off", {})     # {day_index: [names,...]}
+
+    # B/Cオフが満たされた人の集計用
     prefs_now = st.session_state.prefs.copy()
-    prefs_now["kind"] = prefs_now["kind"].astype(str).str.lower()
+    prefs_now["kind"]     = prefs_now["kind"].astype(str).str.lower()
     prefs_now["priority"] = prefs_now["priority"].astype(str).str.upper()
-    B_off_want = defaultdict(set)
-    C_off_want = defaultdict(set)
+
+    from collections import defaultdict as _dd
+    B_off_want = _dd(set)
+    C_off_want = _dd(set)
     for _, r in prefs_now.iterrows():
         if r.get("date") in all_days and r.get("kind") == "off" and r.get("name") in name_to_idx:
             d = all_days.index(r["date"])
@@ -1687,129 +1809,96 @@ if run:
     B_off_granted = {d: sorted([nm for nm in B_off_want.get(d, set()) if nm not in assigned_set_by_day[d]]) for d in range(D)}
     C_off_granted = {d: sorted([nm for nm in C_off_want.get(d, set()) if nm not in assigned_set_by_day[d]]) for d in range(D)}
 
+    # まず成功メッセージ（最上段）
+    st.success("✅ 最適化に成功しました。")
+
+    # ===== 1) 日別スケジュール表（★=A希望反映、A休/B休/C休 表示） =====
     rows = []
-    for d, day in enumerate(all_days):
-        row = {"日付": str(day), "曜日": WEEKDAY_JA[day.weekday()]}
+    for d in range(D):
+        row = {"日付": str(all_days[d]), "曜日": WEEKDAY_JA[all_days[d].weekday()]}
         for sname in SHIFTS:
             sidx = SHIFTS.index(sname)
             assigned = [names[i] for i in range(N) if solver.Value(x[(d, sidx, i)]) == 1]
-            starset = set(nm for (dd, ss, nm) in A_star if (dd == d and ss == sname))
-            labeled = [(nm + "★") if (nm in starset) else nm for nm in assigned]
-            row[SHIFT_LABEL[sname]] = ",".join(labeled)
-        aoff_names = A_off.get(d, [])
-        row["A休"] = ",".join(sorted(aoff_names)) if aoff_names else ""
+            starset  = {nm for (dd, ss, nm) in A_star if (dd == d and ss == sname)}
+            labeled  = [(nm + "★") if (nm in starset) else nm for nm in assigned]
+            row[SHIFT_LABEL.get(sname, sname)] = ",".join(labeled)
+        # A/B/C 休み（満たせた人の一覧）
+        row["A休"] = ",".join(sorted(A_off.get(d, []))) if A_off.get(d) else ""
         row["B休"] = ",".join(B_off_granted.get(d, [])) if B_off_granted.get(d) else ""
         row["C休"] = ",".join(C_off_granted.get(d, [])) if C_off_granted.get(d) else ""
         rows.append(row)
+
     out_df = pd.DataFrame(rows)
-
-    viol = []
-    for d, a_names in A_off.items():
-        for nm in a_names:
-            assigned_any = any(
-                isinstance(out_df.loc[d, lbl], str)
-                and nm in [x.strip("★") for x in out_df.loc[d, lbl].split(",") if x]
-                for lbl in ["早番", "日勤1", "日勤2", "日勤3", "遅番", "ICU", "年休"]
-            )
-            if assigned_any:
-                viol.append((all_days[d], nm))
-    if viol:
-        st.error(
-            "A-休みの違反が検出されました（設定の矛盾かバグの可能性）。\n"
-            + "\n".join([f"- {d} {nm}" for d, nm in viol])
-        )
-
     st.subheader("📋 生成スケジュール（★=A希望反映）")
     st.dataframe(out_df, use_container_width=True, hide_index=True)
 
-    # 個人別集計
-    person_stats = []
+# ===== 2) 個人別集計（早/日1/日2/日3/遅/ICU/年休、A/B/Cオフ満足件数、合計/Holiday/Fatigue） =====
+# A/B/C休み「満たせた件数」を個人ごとに集計
+    A_off_count_by_name = {nm: 0 for nm in names}
+    for d, lst in A_off.items():
+        for nm in lst:
+            if nm in A_off_count_by_name:
+                A_off_count_by_name[nm] += 1
+
+    B_off_count_by_name = {nm: 0 for nm in names}
+    C_off_count_by_name = {nm: 0 for nm in names}
+    for d in range(D):
+        for nm in B_off_granted.get(d, []):
+            B_off_count_by_name[nm] += 1
+        for nm in C_off_granted.get(d, []):
+            C_off_count_by_name[nm] += 1
+
     hol_days_idx = [idx for idx, day in enumerate(all_days) if (day.weekday() >= 5 or day in holidays)]
+
+    def _in_cell(lbl: str, di: int, nm: str) -> bool:
+        cell = out_df.loc[di, lbl]
+        if not isinstance(cell, str) or not cell:
+            return False
+        return nm in [x.strip("★") for x in cell.split(",") if x]
+
+    person_stats = []
     for i, nm in enumerate(names):
-        def _has(lbl, di):
-            if not isinstance(out_df.loc[di, lbl], str):
-                return False
-            return nm in [x.strip("★") for x in out_df.loc[di, lbl].split(",") if x]
+        cnt = {lbl: sum(1 for d in range(D) if _in_cell(lbl, d, nm))
+            for lbl in ["早番", "日勤1", "日勤2", "日勤3", "遅番", "ICU", "年休"]}
+        total   = sum(cnt.values())
+        hol_cnt = sum(sum(1 for lbl in ["早番", "日勤1", "日勤2", "日勤3", "遅番", "ICU"] if _in_cell(lbl, d, nm)) for d in hol_days_idx)
+        fatigue = sum(1 for d in range(D - 1) if _in_cell("遅番", d, nm) and _in_cell("早番", d + 1, nm))
+        person_stats.append({
+            "name": nm,
+            "grade": staff_df.iloc[i]["grade"],
+            **cnt,
+            "A休(満足件数)": A_off_count_by_name.get(nm, 0),
+            "B休(満足件数)": B_off_count_by_name.get(nm, 0),
+            "C休(満足件数)": C_off_count_by_name.get(nm, 0),
+            "Total": total,
+            "Holiday": hol_cnt,
+            "Fatigue": fatigue,
+        })
 
-        cnt = {lbl: sum(1 for d in range(D) if _has(lbl, d)) for lbl in ["早番", "日勤1", "日勤2", "日勤3", "遅番", "ICU", "年休"]}
-        total = sum(cnt.values())
-        hol_cnt = sum(sum(1 for lbl in ["早番", "日勤1", "日勤2", "日勤3", "遅番", "ICU"] if _has(lbl, d)) for d in hol_days_idx)
-        fatigue = 0
-        for d in range(D - 1):
-            late = _has("遅番", d)
-            early_next = _has("早番", d + 1)
-            if late and early_next:
-                fatigue += 1
-        person_stats.append({"name": nm, "grade": staff_df.iloc[i]["grade"], **cnt, "Total": total, "Holiday": hol_cnt, "Fatigue": fatigue})
-    stat_df = pd.DataFrame(person_stats)
+    stat_df = pd.DataFrame(person_stats)[
+        ["name","grade","早番","日勤1","日勤2","日勤3","遅番","ICU","年休","A休(満足件数)","B休(満足件数)","C休(満足件数)","Total","Holiday","Fatigue"]
+    ]
 
-    st.subheader("👥 個人別集計（Holiday=土日祝、Fatigue=遅番→翌早番）")
+    st.subheader("👥 個人別集計")
     st.dataframe(stat_df, use_container_width=True, hide_index=True)
 
-    # 未充足の希望（B/C）
-    unmet = []
-    for _, row in st.session_state.prefs.reset_index().iterrows():
-        if row["priority"] not in ("B", "C"):
-            continue
-        if row["date"] not in all_days or row["name"] not in name_to_idx:
-            continue
-        d = all_days.index(row["date"])
-        nm = row["name"]
-        kind = str(row["kind"]).lower()
-
-        def _in(lbl):
-            return isinstance(out_df.loc[d, lbl], str) and nm in [x.strip("★") for x in out_df.loc[d, lbl].split(",") if x]
-
-        got = False
-        if kind == "off":
-            got = not any(_in(lbl) for lbl in ["早番", "日勤1", "日勤2", "日勤3", "遅番", "ICU"])
-        elif kind == "early":
-            got = _in("早番")
-        elif kind == "late":
-            got = _in("遅番")
-        elif kind == "day":
-            got = _in("日勤1") or _in("日勤2")
-        elif kind == "icu":
-            got = _in("ICU")
-        elif kind == "day1":
-            got = _in("日勤1")
-        elif kind == "day2":
-            got = _in("日勤2")
-        elif kind == "vacation":
-            got = _in("年休")    
-        if not got:
-            unmet.append((row["priority"], row["date"], nm, kind))
-
-    auto_disabled_rows = []
-    if len(disabled_pref_ids) > 0:
-        base = st.session_state.prefs.reset_index()
-        hit = base[base["index"].isin(disabled_pref_ids)].copy()
-        for _, r in hit.iterrows():
-            auto_disabled_rows.append((r["priority"], r["date"], r["name"], str(r["kind"]).lower()))
-
-    if unmet:
-        st.subheader("🙇‍♂️ 未充足となった希望（B/C）")
-        show = pd.DataFrame(unmet, columns=["priority", "date", "name", "kind"]).sort_values(["priority", "date", "name"])
-        st.dataframe(show, use_container_width=True, hide_index=True)
-
-    if auto_disabled_rows:
-        st.subheader("⚠️ 自動で無効化した希望（B/C）")
-        show2 = pd.DataFrame(auto_disabled_rows, columns=["priority", "date", "name", "kind"]).sort_values(["priority", "date", "name"])
-        st.dataframe(show2, use_container_width=True, hide_index=True)
-
-    # ダウンロード
+    # CSV/JSON ダウンロード
     json_snapshot = make_snapshot(
-        out_df=out_df, stat_df=stat_df, status=status, objective=solver.ObjectiveValue()
+    out_df=out_df, stat_df=stat_df, status=status,
+    objective=solver.ObjectiveValue(),
+    fair_star=s_fairness, fair_slack_val=STAR_TO_FAIR_SLACK.get(s_fairness, 2)
     )
+
+    import io, json as _json
     buf_json = io.StringIO()
-    buf_json.write(json.dumps(json_snapshot, ensure_ascii=False, indent=2))
+    buf_json.write(_json.dumps(json_snapshot, ensure_ascii=False, indent=2))
     buf_csv = io.StringIO()
     out_df.to_csv(buf_csv, index=False)
 
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
-            "📥 スケジュールCSVをダウンロード（★/A休/B休/C休 付き）",
+            "📥 スケジュールCSVをダウンロード",
             data=buf_csv.getvalue(),
             file_name="schedule.csv",
             mime="text/csv",
@@ -1822,4 +1911,25 @@ if run:
             mime="application/json",
         )
 
+    st.caption(
+        "🧾 **スナップショットJSON** は、年/月・祝日/休診日・スタッフ/希望/固定割当・詳細ウェイト（★）・seed・生成結果を一括保存するバックアップです。後日このJSONを読み込むと、画面の状態を丸ごと再現できます。"
+    )
 
+# -------------------------
+# 結果のメモ欄
+# -------------------------
+st.divider()
+st.subheader("🗒️ メモ")
+st.text_area(
+    "補足・コメント（任意）",
+    placeholder="例: ○○さんのDay2比率が高すぎるため、次回は平日ボーナスを弱める など",
+    key="memo_text",
+    height=120
+)
+
+# -------------------------
+# おわり
+# -------------------------
+st.caption("Resident Scheduler © 2025 Yuji Takahashi")
+
+# ===== ここで Part 4 / 4 終了 =====
