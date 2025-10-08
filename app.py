@@ -140,6 +140,8 @@ def _current_settings_as_dict():
         "pins": st.session_state.get(
             "pins", pd.DataFrame(columns=["date", "name", "shift"])
         ).to_dict(orient="records"),
+        "memo": ss.get("memo_text", ""),  # ← 作成者メモを保存
+
     }
 
 def _apply_snapshot_dict(snap: dict):
@@ -238,6 +240,7 @@ def _apply_snapshot_dict(snap: dict):
         except Exception:
             pass
         ss.pins = pins_df[["date", "name", "shift"]].copy()
+    ss.memo_text = snap.get("memo", ss.get("memo_text", ""))
 
 def make_snapshot(
     year=None, month=None, holidays=None, closed_days=None, special_map=None,
@@ -250,7 +253,8 @@ def make_snapshot(
     enable_fatigue=None, weight_fatigue=None,
     strict_mode=None, fix_repro=None, seed_val=None,
     out_df=None, stat_df=None, status="UNKNOWN", objective=None,
-    fair_star=None, fair_slack_val=None      # ← 追加
+    fair_star=None, fair_slack_val=None,       
+    memo_text=None
 ):
     """実行スナップショット（結果も含める）"""
     ss = st.session_state
@@ -337,6 +341,7 @@ def make_snapshot(
         ],
         "result_table": (out_df.to_dict(orient="records") if out_df is not None else []),
         "person_stats": (stat_df.to_dict(orient="records") if stat_df is not None else []),
+        "memo": (memo_text if memo_text is not None else ss.get("memo_text", "")),  
     }
 
 def apply_snapshot(js: dict):
@@ -428,6 +433,8 @@ def apply_snapshot(js: dict):
             return pd.DataFrame(rows)
 
         st.session_state.pins = parse_pins(js.get("pins", []))
+
+        st.session_state.memo_text = js.get("memo", st.session_state.get("memo_text", ""))  
 
         st.success("スナップショットを読み込みました。年/月・祝日等を反映するため再描画します。")
         st.rerun()
@@ -716,7 +723,7 @@ with st.sidebar.expander("⚙️ 詳細ウェイト設定", expanded=False):
     s_icu_ratio = star_control(
         "J2のICU希望比率の遵守（強さ）", key="star_icu_ratio",
         help="J2の設定したICU希望比率に近づける重み。",
-        default=2
+        default=3
     )
     s_pref_b = star_control(
         "希望B未充足ペナルティ（強さ）", key="star_pref_b",
@@ -1769,30 +1776,121 @@ if run_btn:
 
     st.write(f"**Solver status:** {status}")
 
-    # ← ここから先はボタンを押した時だけ評価される
+    # 可行解チェック
     if status not in ("OPTIMAL", "FEASIBLE"):
         st.error("❌ 可行解が見つかりませんでした。A希望・特例・総勤務回数の整合をご確認ください。")
         st.stop()
 
-    # 成功時の表示（out_df/stat_df の作成や st.success など）
-    # ... あなたの成功時ブロックをここに置く ...
-
-    # ---------- ここから成功時だけ表示 ----------
+    # ---------- 成功時 ----------
     x        = artifacts["x"]
     DAY      = artifacts["DAY"]
     A_star   = artifacts.get("A_star", set())
     A_off    = artifacts.get("A_off", {})     # {day_index: [names,...]}
 
-    # B/Cオフが満たされた人の集計用
+    # ===== B/C 希望の充足判定（全種別） =====
     prefs_now = st.session_state.prefs.copy()
     prefs_now["kind"]     = prefs_now["kind"].astype(str).str.lower()
     prefs_now["priority"] = prefs_now["priority"].astype(str).str.upper()
+    # この月・既知の名前だけに限定
+    prefs_now = prefs_now[prefs_now["date"].isin(all_days) & prefs_now["name"].isin(name_to_idx.keys())]
 
-    from collections import defaultdict as _dd
-    B_off_want = _dd(set)
-    C_off_want = _dd(set)
+    # 便利なシフトindex
+    E_IDX   = SHIFTS.index("ER_Early")
+    D1_IDX  = SHIFTS.index("ER_Day1")
+    D2_IDX  = SHIFTS.index("ER_Day2")
+    L_IDX   = SHIFTS.index("ER_Late")
+    ICU_IDX = SHIFTS.index("ICU")
+    VAC_IDX = SHIFTS.index("VAC")
+
+    from collections import defaultdict
+    total_B = defaultdict(int); hit_B = defaultdict(int)
+    total_C = defaultdict(int); hit_C = defaultdict(int)
+    unmet_examples = []  # タイトルメッセージ用に、未充足の例を数件拾う
+
+    def _sat(d: int, i: int, kind: str) -> bool:
+        """(日index d, 人index i) が kind の B/C希望を満たしているか"""
+        # その日の本人の割当有無
+        assigned_any = sum(solver.Value(x[(d, s, i)]) for s in range(len(SHIFTS))) > 0
+        if kind == "off":
+            return not assigned_any
+
+        if kind == "early":
+            return (DAY[d]["req"]["ER_Early"] == 1) and (solver.Value(x[(d, E_IDX, i)]) == 1)
+
+        if kind in ("day1", "day_1", "d1"):
+            return (DAY[d]["req"]["ER_Day1"] == 1) and (solver.Value(x[(d, D1_IDX, i)]) == 1)
+
+        if kind in ("day2", "day_2", "d2"):
+            return DAY[d]["allow_d2"] and (solver.Value(x[(d, D2_IDX, i)]) == 1)
+
+        if kind == "day":
+            ok1 = (DAY[d]["req"]["ER_Day1"] == 1) and (solver.Value(x[(d, D1_IDX, i)]) == 1)
+            ok2 = DAY[d]["allow_d2"] and (solver.Value(x[(d, D2_IDX, i)]) == 1)
+            return ok1 or ok2
+
+        if kind == "late":
+            return (DAY[d]["req"]["ER_Late"] == 1) and (solver.Value(x[(d, L_IDX, i)]) == 1)
+
+        if kind == "icu":
+            return (i in J2_idx) and DAY[d]["allow_icu"] and (solver.Value(x[(d, ICU_IDX, i)]) == 1)
+
+        if kind == "vacation":
+            return solver.Value(x[(d, VAC_IDX, i)]) == 1
+
+        # 未知の種類は満たせていない扱い
+        return False
+
+    # 人別・優先度別の総数/充足数をカウント
     for _, r in prefs_now.iterrows():
-        if r.get("date") in all_days and r.get("kind") == "off" and r.get("name") in name_to_idx:
+        d = all_days.index(r["date"])
+        i = name_to_idx[r["name"]]
+        k = r["kind"]
+        p = r["priority"]
+        if p not in ("B", "C"):
+            continue
+        ok = _sat(d, i, k)
+        if p == "B":
+            total_B[r["name"]] += 1
+            hit_B[r["name"]] += int(ok)
+        else:
+            total_C[r["name"]] += 1
+            hit_C[r["name"]] += int(ok)
+        if (not ok) and (len(unmet_examples) < 5):
+            unmet_examples.append(f"{r['date']} {r['name']}（{k}）")
+
+    # ===== タイトルメッセージ（成功でも違反があれば必ず出す） =====
+    total_unmet_B = sum(max(0, total_B[nm] - hit_B[nm]) for nm in names)
+    total_unmet_C = sum(max(0, total_C[nm] - hit_C[nm]) for nm in names)
+    bc_violations = total_unmet_B + total_unmet_C
+
+    if bc_violations > 0:
+        head = f"⚠️ B/C希望の未充足: B={total_unmet_B}件, C={total_unmet_C}件"
+        if unmet_examples:
+            head += " 例: " + ", ".join(unmet_examples)
+        st.error(head)
+    else:
+        st.success("✅ 最適化に成功しました（B/C希望は全て充足）。")
+        # ※ 全充足時は詳細メッセージは出さない
+
+    # ===== J2のICU希望比率：未達アラート =====
+    icu_shortfalls = []  # [(name, actual, target)]
+    for j in J2_idx:
+        nm = names[j]
+        desired = float(staff_df.iloc[j]["desired_icu_ratio"])  # 0.0〜1.0
+        target  = int(round(desired * int(per_person_total)))
+        actual  = sum(int(solver.Value(x[(d, ICU_IDX, j)])) for d in range(D))
+        if target > 0 and actual < target:
+            icu_shortfalls.append((nm, actual, target))
+    if icu_shortfalls:
+        ex = ", ".join([f"{nm}({a}/{t})" for nm, a, t in icu_shortfalls[:5]])
+        st.error(f"⚠️ J2のICU希望比率の未達が {len(icu_shortfalls)} 名あります。例: {ex}")
+
+    # ===== 1) 日別スケジュール表（★=A希望反映、A休/B休/C休 表示） =====
+    # B/C の「休み」が満たせた人を日別表示
+    from collections import defaultdict as _dd
+    B_off_want = _dd(set); C_off_want = _dd(set)
+    for _, r in prefs_now.iterrows():
+        if r["kind"] == "off":
             d = all_days.index(r["date"])
             if r["priority"] == "B":
                 B_off_want[d].add(r["name"])
@@ -1809,10 +1907,6 @@ if run_btn:
     B_off_granted = {d: sorted([nm for nm in B_off_want.get(d, set()) if nm not in assigned_set_by_day[d]]) for d in range(D)}
     C_off_granted = {d: sorted([nm for nm in C_off_want.get(d, set()) if nm not in assigned_set_by_day[d]]) for d in range(D)}
 
-    # まず成功メッセージ（最上段）
-    st.success("✅ 最適化に成功しました。")
-
-    # ===== 1) 日別スケジュール表（★=A希望反映、A休/B休/C休 表示） =====
     rows = []
     for d in range(D):
         row = {"日付": str(all_days[d]), "曜日": WEEKDAY_JA[all_days[d].weekday()]}
@@ -1832,22 +1926,7 @@ if run_btn:
     st.subheader("📋 生成スケジュール（★=A希望反映）")
     st.dataframe(out_df, use_container_width=True, hide_index=True)
 
-# ===== 2) 個人別集計（早/日1/日2/日3/遅/ICU/年休、A/B/Cオフ満足件数、合計/Holiday/Fatigue） =====
-# A/B/C休み「満たせた件数」を個人ごとに集計
-    A_off_count_by_name = {nm: 0 for nm in names}
-    for d, lst in A_off.items():
-        for nm in lst:
-            if nm in A_off_count_by_name:
-                A_off_count_by_name[nm] += 1
-
-    B_off_count_by_name = {nm: 0 for nm in names}
-    C_off_count_by_name = {nm: 0 for nm in names}
-    for d in range(D):
-        for nm in B_off_granted.get(d, []):
-            B_off_count_by_name[nm] += 1
-        for nm in C_off_granted.get(d, []):
-            C_off_count_by_name[nm] += 1
-
+    # ===== 2) 個人別集計（早/日1/日2/日3/遅番/ICU/年休、B/C分数表記、ICU希望達成、未達アラート） =====
     hol_days_idx = [idx for idx, day in enumerate(all_days) if (day.weekday() >= 5 or day in holidays)]
 
     def _in_cell(lbl: str, di: int, nm: str) -> bool:
@@ -1856,64 +1935,110 @@ if run_btn:
             return False
         return nm in [x.strip("★") for x in cell.split(",") if x]
 
-    person_stats = []
+    def _frac(hit: int, total: int) -> str:
+        return "-" if total == 0 else f"{hit}/{total}"
+
+    person_rows = []
     for i, nm in enumerate(names):
         cnt = {lbl: sum(1 for d in range(D) if _in_cell(lbl, d, nm))
-            for lbl in ["早番", "日勤1", "日勤2", "日勤3", "遅番", "ICU", "年休"]}
+               for lbl in ["早番", "日勤1", "日勤2", "日勤3", "遅番", "ICU", "年休"]}
         total   = sum(cnt.values())
-        hol_cnt = sum(sum(1 for lbl in ["早番", "日勤1", "日勤2", "日勤3", "遅番", "ICU"] if _in_cell(lbl, d, nm)) for d in hol_days_idx)
+        hol_cnt = sum(
+            sum(1 for lbl in ["早番", "日勤1", "日勤2", "日勤3", "遅番", "ICU"] if _in_cell(lbl, d, nm))
+            for d in hol_days_idx
+        )
         fatigue = sum(1 for d in range(D - 1) if _in_cell("遅番", d, nm) and _in_cell("早番", d + 1, nm))
-        person_stats.append({
+
+        # ICU希望（J2のみ目標あり）
+        desired_ratio = float(staff_df.iloc[i]["desired_icu_ratio"])
+        icu_target    = int(round(desired_ratio * int(per_person_total))) if staff_df.iloc[i]["grade"] == "J2" else 0
+        icu_actual    = cnt["ICU"]
+        icu_col       = "-" if icu_target == 0 else f"{icu_actual}/{icu_target}"
+
+        person_rows.append({
             "name": nm,
             "grade": staff_df.iloc[i]["grade"],
             **cnt,
-            "A休(満足件数)": A_off_count_by_name.get(nm, 0),
-            "B休(満足件数)": B_off_count_by_name.get(nm, 0),
-            "C休(満足件数)": C_off_count_by_name.get(nm, 0),
+            "B希望充足": _frac(hit_B[nm], total_B[nm]),
+            "C希望充足": _frac(hit_C[nm], total_C[nm]),
+            "ICU希望達成": icu_col,
             "Total": total,
             "Holiday": hol_cnt,
             "Fatigue": fatigue,
         })
 
-    stat_df = pd.DataFrame(person_stats)[
-        ["name","grade","早番","日勤1","日勤2","日勤3","遅番","ICU","年休","A休(満足件数)","B休(満足件数)","C休(満足件数)","Total","Holiday","Fatigue"]
+    stat_df = pd.DataFrame(person_rows)[
+        ["name","grade","早番","日勤1","日勤2","日勤3","遅番","ICU","年休",
+         "B希望充足","C希望充足","ICU希望達成","Total","Holiday","Fatigue"]
     ]
 
-    st.subheader("👥 個人別集計")
-    st.dataframe(stat_df, use_container_width=True, hide_index=True)
+    # 未充足セル（B/C/ICU）を淡い赤＋赤字でマーキング
+    def _alert_style(series):
+        styles = []
+        for v in series:
+            if isinstance(v, str) and "/" in v:
+                try:
+                    a, b = v.split("/")
+                    a = int(a) if a != "-" else 0
+                    b = int(b) if b != "-" else 0
+                    styles.append("background-color:#FFF1F1;color:#B10000;" if (b > 0 and a < b) else "")
+                except Exception:
+                    styles.append("")
+            else:
+                styles.append("")
+        return styles
 
-    # CSV/JSON ダウンロード
+    st.subheader("👥 個人別集計（B/Cは分数表記、ICU希望達成を追加。未達セルを淡色で警告）")
+    styled = (
+        stat_df
+        .style
+        .apply(_alert_style, subset=["B希望充足","C希望充足","ICU希望達成"])
+    )
+    st.write(styled)
+
+    # ===== 3) 改善ヒント（B/C違反がある時だけ） =====
+    if bc_violations > 0:
+        tips = []
+        tips.append("・B/C未充足が出ています。希望ウェイト（⭐️）を上げると優先されやすくなります。")
+        if s_fairness == 3:
+            tips.append("・『休日公平性』を⭐️3→⭐️2（または⭐️1）に下げると取りやすくなる場合があります。")
+        if max_consecutive <= 4:
+            tips.append("・『最大連勤日数』を+1（例: 5→6）にすると探索の自由度が上がります。")
+        if enable_fatigue and weight_fatigue >= STAR_TO_WEIGHT_FATIGUE.get(2, 12.0):
+            tips.append("・『疲労ペナルティ（遅番→翌早番）』を⭐️1に下げると割当の自由度が増えます。")
+        if (weight_day2_weekday + weight_day2_wed_bonus) > 0 or (weight_day3_weekday + weight_day3_wed_bonus) > 0:
+            tips.append("・Day2/Day3のボーナス⭐️を弱めると、B/C希望を優先しやすくなります。")
+        # ICU未達があるなら関連ヒントも（上のアラートに合わせて）
+        if icu_shortfalls:
+            if not allow_weekend_icu:
+                tips.append("・ICU希望の未達があるため『週末ICUを許可』をONにすることを検討してください。")
+            tips.append("・J2の『ICU希望比率』の⭐️（遵守強さ）を上げると、ICUが優先されやすくなります。")
+        st.info("**詳細メッセージ（改善のヒント）**\n\n" + "\n".join(tips))
+
+    # ===== 4) CSV/JSON ダウンロード =====
     json_snapshot = make_snapshot(
-    out_df=out_df, stat_df=stat_df, status=status,
-    objective=solver.ObjectiveValue(),
-    fair_star=s_fairness, fair_slack_val=STAR_TO_FAIR_SLACK.get(s_fairness, 2)
+        out_df=out_df, stat_df=stat_df, status=status,
+        objective=solver.ObjectiveValue(),
+        fair_star=s_fairness, fair_slack_val=STAR_TO_FAIR_SLACK.get(s_fairness, 2)
     )
 
     import io, json as _json
-    buf_json = io.StringIO()
-    buf_json.write(_json.dumps(json_snapshot, ensure_ascii=False, indent=2))
-    buf_csv = io.StringIO()
-    out_df.to_csv(buf_csv, index=False)
+    buf_json = io.StringIO(); buf_json.write(_json.dumps(json_snapshot, ensure_ascii=False, indent=2))
+    buf_csv  = io.StringIO(); out_df.to_csv(buf_csv, index=False)
 
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
             "📥 スケジュールCSVをダウンロード",
-            data=buf_csv.getvalue(),
-            file_name="schedule.csv",
-            mime="text/csv",
+            data=buf_csv.getvalue(), file_name="schedule.csv", mime="text/csv"
         )
     with c2:
         st.download_button(
             "🧾 スナップショットJSONをダウンロード",
-            data=buf_json.getvalue(),
-            file_name="run_snapshot.json",
-            mime="application/json",
+            data=buf_json.getvalue(), file_name="run_snapshot.json", mime="application/json"
         )
 
-    st.caption(
-        "🧾 **スナップショットJSON** は、年/月・祝日/休診日・スタッフ/希望/固定割当・詳細ウェイト（★）・seed・生成結果を一括保存するバックアップです。後日このJSONを読み込むと、画面の状態を丸ごと再現できます。"
-    )
+    st.caption("🧾 スナップショットJSONは、条件や結果を丸ごと保存/復元できます。")
 
 # -------------------------
 # 結果のメモ欄
